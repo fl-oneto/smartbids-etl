@@ -9,8 +9,11 @@ from __future__ import annotations
 import logging
 import os
 import sys
+import time
 from collections.abc import Iterable, Sequence
 from datetime import date
+from logging.handlers import RotatingFileHandler
+from pathlib import Path
 from typing import Any
 
 import psycopg
@@ -20,11 +23,35 @@ from psycopg.rows import dict_row
 
 BATCH_SIZE = 2_000
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s | %(levelname)s | %(message)s",
-)
 LOGGER = logging.getLogger("etl_smartbids")
+
+
+def configure_logging() -> Path:
+    """Registra la ejecución en consola y en un archivo con rotación."""
+    log_dir = Path(os.getenv("LOG_DIR", "logs"))
+    log_dir.mkdir(parents=True, exist_ok=True)
+    log_file = log_dir / "etl_dw.log"
+
+    formatter = logging.Formatter(
+        "%(asctime)s | %(levelname)s | %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S",
+    )
+    console_handler = logging.StreamHandler()
+    console_handler.setFormatter(formatter)
+    file_handler = RotatingFileHandler(
+        log_file,
+        maxBytes=5 * 1024 * 1024,
+        backupCount=5,
+        encoding="utf-8",
+    )
+    file_handler.setFormatter(formatter)
+
+    LOGGER.setLevel(logging.INFO)
+    LOGGER.handlers.clear()
+    LOGGER.addHandler(console_handler)
+    LOGGER.addHandler(file_handler)
+    LOGGER.propagate = False
+    return log_file
 
 
 def connection_kwargs(database: str) -> dict[str, Any]:
@@ -694,10 +721,12 @@ def validate(target: psycopg.Connection[Any]) -> None:
 
 def main() -> int:
     load_dotenv()
+    log_file = configure_logging()
     source_db = os.getenv("DB_ORIGEN", "smartbids")
     target_db = os.getenv("DB_DESTINO", "smartbids_dw")
+    started_at = time.monotonic()
 
-    LOGGER.info("Iniciando ETL %s -> %s", source_db, target_db)
+    LOGGER.info("Iniciando ETL %s -> %s | log=%s", source_db, target_db, log_file)
     try:
         with psycopg.connect(**connection_kwargs(source_db)) as source:
             with psycopg.connect(**connection_kwargs(target_db)) as target:
@@ -709,10 +738,17 @@ def main() -> int:
                 load_items(source, target, products, providers, buyers)
                 validate(target)
                 target.commit()
-        LOGGER.info("ETL finalizado correctamente")
+        LOGGER.info(
+            "ETL finalizado correctamente | duración=%.2f segundos",
+            time.monotonic() - started_at,
+        )
         return 0
     except Exception:
-        LOGGER.exception("El ETL falló; la transacción de destino fue revertida")
+        LOGGER.exception(
+            "El ETL falló; la transacción de destino fue revertida | "
+            "duración=%.2f segundos",
+            time.monotonic() - started_at,
+        )
         return 1
 
 

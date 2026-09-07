@@ -30,6 +30,26 @@ está excluido de Git.
 python etl_dw.py
 ```
 
+## Registro de ejecución
+
+Cada ejecución muestra el avance en la consola y también lo guarda en:
+
+```text
+logs/etl_dw.log
+```
+
+El registro incluye el inicio y término, duración, filas procesadas por tabla,
+conteos de validación y el detalle del error si la carga falla. El archivo rota
+al alcanzar 5 MB y conserva hasta cinco archivos anteriores. La carpeta
+`logs/` está excluida de Git.
+
+Para guardar los registros en otra ubicación, define opcionalmente `LOG_DIR`
+en `.env`, por ejemplo:
+
+```env
+LOG_DIR=H:\\Logs\\smartbids-etl
+```
+
 La carga se ejecuta en este orden:
 
 1. `dw.dim_producto`
