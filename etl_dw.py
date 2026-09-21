@@ -107,53 +107,24 @@ def load_products(
     source: psycopg.Connection[Any], target: psycopg.Connection[Any]
 ) -> None:
     LOGGER.info("Extrayendo dim_producto")
+
     rows = fetch_all(
         source,
         """
-        WITH combinaciones AS (
-            SELECT
-                codigo_producto,
-                nombre_producto,
-                codigo_categoria,
-                categoria,
-                rubro_n1,
-                rubro_n2,
-                rubro_n3,
-                ROW_NUMBER() OVER (
-                    PARTITION BY codigo_producto
-                    ORDER BY COUNT(*) DESC,
-                             codigo_categoria NULLS LAST,
-                             categoria NULLS LAST
-                ) AS posicion
-            FROM staging.vw_oc_limpias
-            GROUP BY
-                codigo_producto,
-                nombre_producto,
-                codigo_categoria,
-                categoria,
-                rubro_n1,
-                rubro_n2,
-                rubro_n3
-        )
         SELECT
             BTRIM(p.codigo_producto::text) AS producto_codigo,
-            COALESCE(
-                NULLIF(BTRIM(p.descripcion), ''),
-                NULLIF(BTRIM(c.nombre_producto), ''),
-                'Producto sin nombre'
-            ) AS producto_nombre,
-            c.codigo_categoria AS producto_categoria_codigo,
-            c.categoria AS producto_categoria,
-            COALESCE(NULLIF(BTRIM(p.glosa_nivel2), ''), c.rubro_n1)
-                AS producto_rubro_n1,
-            COALESCE(NULLIF(BTRIM(p.glosa_nivel3), ''), c.rubro_n2)
-                AS producto_rubro_n2,
-            COALESCE(NULLIF(BTRIM(p.glosa_nivel4), ''), c.rubro_n3)
-                AS producto_rubro_n3
-        FROM combinaciones c
-        JOIN catalog.producto p
-          ON BTRIM(p.codigo_producto::text) = c.codigo_producto
-        WHERE c.posicion = 1
+            NULLIF(BTRIM(p.descripcion), '') AS producto_descripcion,
+            NULLIF(BTRIM(gp.nombre_grupo_producto), '') AS producto_grupo,
+            NULLIF(BTRIM(n1.descripcion), '') AS producto_nivel1,
+            NULLIF(BTRIM(p.glosa_nivel2), '') AS producto_nivel2,
+            NULLIF(BTRIM(p.glosa_nivel3), '') AS producto_nivel3,
+            NULLIF(BTRIM(p.glosa_nivel4), '') AS producto_nivel4
+        FROM catalog.producto p
+        LEFT JOIN catalog.nivel1_producto n1
+            ON p.nivel1 = n1.codigo_nivel1
+        LEFT JOIN catalog.grupo_producto gp
+            ON n1.codigo_grupo_producto = gp.codigo_grupo_producto
+        WHERE p.activo = TRUE
         ORDER BY producto_codigo
         """,
     )
@@ -161,35 +132,39 @@ def load_products(
     statement = """
         INSERT INTO dw.dim_producto (
             producto_codigo,
-            producto_nombre,
-            producto_categoria_codigo,
-            producto_categoria,
-            producto_rubro_n1,
-            producto_rubro_n2,
-            producto_rubro_n3
-        ) VALUES (%s, %s, %s, %s, %s, %s, %s)
+            producto_descripcion,
+            producto_grupo,
+            producto_nivel1,
+            producto_nivel2,
+            producto_nivel3,
+            producto_nivel4
+        )
+        VALUES (%s, %s, %s, %s, %s, %s, %s)
         ON CONFLICT (producto_codigo) DO UPDATE SET
-            producto_nombre = EXCLUDED.producto_nombre,
-            producto_categoria_codigo = EXCLUDED.producto_categoria_codigo,
-            producto_categoria = EXCLUDED.producto_categoria,
-            producto_rubro_n1 = EXCLUDED.producto_rubro_n1,
-            producto_rubro_n2 = EXCLUDED.producto_rubro_n2,
-            producto_rubro_n3 = EXCLUDED.producto_rubro_n3
+            producto_descripcion = EXCLUDED.producto_descripcion,
+            producto_grupo = EXCLUDED.producto_grupo,
+            producto_nivel1 = EXCLUDED.producto_nivel1,
+            producto_nivel2 = EXCLUDED.producto_nivel2,
+            producto_nivel3 = EXCLUDED.producto_nivel3,
+            producto_nivel4 = EXCLUDED.producto_nivel4
     """
+
     values = [
         (
             row["producto_codigo"],
-            row["producto_nombre"],
-            row["producto_categoria_codigo"],
-            row["producto_categoria"],
-            row["producto_rubro_n1"],
-            row["producto_rubro_n2"],
-            row["producto_rubro_n3"],
+            row["producto_descripcion"],
+            row["producto_grupo"],
+            row["producto_nivel1"],
+            row["producto_nivel2"],
+            row["producto_nivel3"],
+            row["producto_nivel4"],
         )
         for row in rows
     ]
+
     for batch in chunks(values):
         execute_many(target, statement, batch)
+
     LOGGER.info("dim_producto procesada: %s filas", len(rows))
 
 
@@ -197,526 +172,253 @@ def load_providers(
     source: psycopg.Connection[Any], target: psycopg.Connection[Any]
 ) -> None:
     LOGGER.info("Extrayendo dim_proveedor")
+
     rows = fetch_all(
         source,
         """
-        WITH combinaciones AS (
-            SELECT
-                codigo_proveedor,
-                proveedor_sucursal_codigo,
-                nombre_proveedor,
-                comuna_proveedor,
-                region_proveedor,
-                pais_proveedor,
-                ROW_NUMBER() OVER (
-                    PARTITION BY codigo_proveedor, proveedor_sucursal_codigo
-                    ORDER BY COUNT(*) DESC,
-                             nombre_proveedor NULLS LAST,
-                             comuna_proveedor NULLS LAST
-                ) AS posicion
-            FROM staging.vw_oc_limpias
-            GROUP BY
-                codigo_proveedor,
-                proveedor_sucursal_codigo,
-                nombre_proveedor,
-                comuna_proveedor,
-                region_proveedor,
-                pais_proveedor
-        )
         SELECT
-            c.codigo_proveedor AS proveedor_codigo,
-            c.proveedor_sucursal_codigo::bigint
-                AS proveedor_sucursal_codigo,
-            COALESCE(
-                NULLIF(BTRIM(p.prov_razon_social), ''),
-                NULLIF(BTRIM(c.nombre_proveedor), ''),
-                'Proveedor sin nombre'
-            ) AS proveedor_nombre,
-            c.comuna_proveedor AS proveedor_comuna,
-            c.region_proveedor AS proveedor_region,
-            c.pais_proveedor AS proveedor_pais
-        FROM combinaciones c
-        LEFT JOIN catalog.proveedor p
-          ON p.prov_codigo_proveedor::text = c.codigo_proveedor
-         AND p.prov_codigo_sucursal = c.proveedor_sucursal_codigo::bigint
-        WHERE c.posicion = 1
-        ORDER BY proveedor_codigo, proveedor_sucursal_codigo
+            p.prov_codigo_proveedor AS proveedor_codigo,
+
+            LOWER(NULLIF(BTRIM(p.prov_nombre), ''))
+                AS proveedor_nombre,
+
+            c.nombre_comuna AS proveedor_comuna,
+
+            pr.nombre_provincia AS proveedor_provincia,
+
+            r.nombre_region AS proveedor_region,
+
+            pa.pais_nombre AS proveedor_pais,
+
+            LOWER(NULLIF(BTRIM(ae.nombre_actividad), ''))
+                AS proveedor_actividad_econ,
+
+            LOWER(NULLIF(BTRIM(ra.nombre_rubro), ''))
+                AS proveedor_rubro,
+
+            LOWER(NULLIF(BTRIM(sa.nombre_subrubro), ''))
+                AS proveedor_subrubro
+
+        FROM catalog.proveedor p
+
+        LEFT JOIN catalog.comuna c
+            ON p.prov_codigo_comuna = c.codigo_comuna
+
+        LEFT JOIN catalog.provincia pr
+            ON c.codigo_provincia = pr.codigo_provincia
+
+        LEFT JOIN catalog.region r
+            ON pr.codigo_region = r.codigo_region
+
+        LEFT JOIN catalog.pais pa
+            ON p.prov_codigo_pais = pa.pais_codigo
+
+        LEFT JOIN catalog.actividad_economica ae
+            ON p.prov_cod_actividad_economica = ae.codigo_actividad
+
+        LEFT JOIN catalog.subrubro_actividad sa
+            ON ae.codigo_subrubro = sa.codigo_subrubro
+
+        LEFT JOIN catalog.rubro_actividad ra
+            ON sa.codigo_rubro = ra.codigo_rubro
+
+        WHERE p.prov_activo = TRUE
+
+        ORDER BY proveedor_codigo
         """,
     )
 
     statement = """
         INSERT INTO dw.dim_proveedor (
             proveedor_codigo,
-            proveedor_sucursal_codigo,
             proveedor_nombre,
             proveedor_comuna,
+            proveedor_provincia,
             proveedor_region,
-            proveedor_pais
-        ) VALUES (%s, %s, %s, %s, %s, %s)
-        ON CONFLICT (proveedor_codigo, proveedor_sucursal_codigo)
-        DO UPDATE SET
+            proveedor_pais,
+            proveedor_actividad_econ,
+            proveedor_rubro,
+            proveedor_subrubro
+        )
+        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+        ON CONFLICT (proveedor_codigo) DO UPDATE SET
             proveedor_nombre = EXCLUDED.proveedor_nombre,
             proveedor_comuna = EXCLUDED.proveedor_comuna,
+            proveedor_provincia = EXCLUDED.proveedor_provincia,
             proveedor_region = EXCLUDED.proveedor_region,
-            proveedor_pais = EXCLUDED.proveedor_pais
+            proveedor_pais = EXCLUDED.proveedor_pais,
+            proveedor_actividad_econ = EXCLUDED.proveedor_actividad_econ,
+            proveedor_rubro = EXCLUDED.proveedor_rubro,
+            proveedor_subrubro = EXCLUDED.proveedor_subrubro
     """
+
     values = [
         (
             row["proveedor_codigo"],
-            row["proveedor_sucursal_codigo"],
             row["proveedor_nombre"],
             row["proveedor_comuna"],
+            row["proveedor_provincia"],
             row["proveedor_region"],
             row["proveedor_pais"],
+            row["proveedor_actividad_econ"],
+            row["proveedor_rubro"],
+            row["proveedor_subrubro"],
         )
         for row in rows
     ]
+
     for batch in chunks(values):
         execute_many(target, statement, batch)
-    LOGGER.info("dim_proveedor procesada: %s filas", len(rows))
 
+    LOGGER.info("dim_proveedor procesada: %s filas", len(rows))
 
 def load_buyers(
     source: psycopg.Connection[Any], target: psycopg.Connection[Any]
 ) -> None:
     LOGGER.info("Extrayendo dim_comprador")
+
     rows = fetch_all(
         source,
         """
-        WITH combinaciones AS (
-            SELECT
-                SPLIT_PART(codigo_orden, '-', 1)::bigint
-                    AS unidad_codigo_publico,
-                unidad_compra,
-                codigo_organismo_publico,
-                organismo_publico,
-                sector,
-                ciudad_unidad_compra,
-                region_unidad_compra,
-                pais_unidad_compra,
-                ROW_NUMBER() OVER (
-                    PARTITION BY SPLIT_PART(codigo_orden, '-', 1)::bigint
-                    ORDER BY COUNT(*) DESC,
-                             unidad_compra NULLS LAST,
-                             organismo_publico NULLS LAST
-                ) AS posicion
-            FROM staging.vw_oc_limpias
-            WHERE SPLIT_PART(codigo_orden, '-', 1) ~ '^[0-9]+$'
-            GROUP BY
-                SPLIT_PART(codigo_orden, '-', 1)::bigint,
-                unidad_compra,
-                codigo_organismo_publico,
-                organismo_publico,
-                sector,
-                ciudad_unidad_compra,
-                region_unidad_compra,
-                pais_unidad_compra
-        )
         SELECT
-            c.unidad_codigo_publico AS comprador_unidad_codigo_publico,
-            COALESCE(
-                NULLIF(BTRIM(uc.ucom_descripcion), ''),
-                NULLIF(BTRIM(c.unidad_compra), ''),
-                'Unidad de compra sin nombre'
-            ) AS comprador_unidad_nombre,
-            c.codigo_organismo_publico::bigint AS comprador_organismo_codigo,
-            COALESCE(
-                NULLIF(BTRIM(o.org_nombre), ''),
-                NULLIF(BTRIM(c.organismo_publico), ''),
-                'Organismo sin nombre'
-            ) AS comprador_organismo_nombre,
-            c.sector AS comprador_sector,
-            c.ciudad_unidad_compra AS comprador_ciudad,
-            c.region_unidad_compra AS comprador_region,
-            c.pais_unidad_compra AS comprador_pais
-        FROM combinaciones c
-        LEFT JOIN procurement.unidad_compra uc
-          ON uc.codigo_unidad_compra = c.unidad_codigo_publico
-        LEFT JOIN catalog.organismo o
-          ON o.codigo_organismo = c.codigo_organismo_publico::bigint
-        WHERE c.posicion = 1
-        ORDER BY comprador_unidad_codigo_publico
+            o.codigo_organismo AS comprador_organismo_codigo,
+
+            NULLIF(BTRIM(o.org_nombre), '')
+                AS comprador_organismo_nombre,
+
+            NULLIF(BTRIM(o.org_sigla), '')
+                AS comprador_org_sigla,
+
+            NULLIF(BTRIM(s.nombre_sector), '')
+                AS comprador_sector,
+
+            NULLIF(BTRIM(c.nombre_comuna), '')
+                AS comprador_ciudad,
+
+            NULLIF(BTRIM(p.nombre_provincia), '')
+                AS comprador_provincia,
+
+            NULLIF(BTRIM(r.nombre_region), '')
+                AS comprador_region,
+
+            'Chile' AS comprador_pais
+
+        FROM catalog.organismo o
+
+        LEFT JOIN catalog.sector s
+            ON o.org_codigo_sector = s.codigo_sector
+
+        LEFT JOIN catalog.comuna c
+            ON o.org_codigo_comuna = c.codigo_comuna
+
+        LEFT JOIN catalog.provincia p
+            ON c.codigo_provincia = p.codigo_provincia
+
+        LEFT JOIN catalog.region r
+            ON p.codigo_region = r.codigo_region
+
+        WHERE o.activo = TRUE
+
+        ORDER BY comprador_organismo_codigo
         """,
     )
 
     statement = """
         INSERT INTO dw.dim_comprador (
-            comprador_unidad_codigo_publico,
-            comprador_unidad_nombre,
             comprador_organismo_codigo,
             comprador_organismo_nombre,
+            comprador_org_sigla,
             comprador_sector,
             comprador_ciudad,
+            comprador_provincia,
             comprador_region,
             comprador_pais
-        ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
-        ON CONFLICT (comprador_unidad_codigo_publico) DO UPDATE SET
-            comprador_unidad_nombre = EXCLUDED.comprador_unidad_nombre,
-            comprador_organismo_codigo = EXCLUDED.comprador_organismo_codigo,
+        )
+        VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+        ON CONFLICT (comprador_organismo_codigo) DO UPDATE SET
             comprador_organismo_nombre = EXCLUDED.comprador_organismo_nombre,
+            comprador_org_sigla = EXCLUDED.comprador_org_sigla,
             comprador_sector = EXCLUDED.comprador_sector,
             comprador_ciudad = EXCLUDED.comprador_ciudad,
+            comprador_provincia = EXCLUDED.comprador_provincia,
             comprador_region = EXCLUDED.comprador_region,
             comprador_pais = EXCLUDED.comprador_pais
     """
+
     values = [
         (
-            row["comprador_unidad_codigo_publico"],
-            row["comprador_unidad_nombre"],
             row["comprador_organismo_codigo"],
             row["comprador_organismo_nombre"],
+            row["comprador_org_sigla"],
             row["comprador_sector"],
             row["comprador_ciudad"],
+            row["comprador_provincia"],
             row["comprador_region"],
             row["comprador_pais"],
         )
         for row in rows
     ]
+
     for batch in chunks(values):
         execute_many(target, statement, batch)
+
     LOGGER.info("dim_comprador procesada: %s filas", len(rows))
-
-
-def dimension_maps(
-    target: psycopg.Connection[Any],
-) -> tuple[dict[str, int], dict[tuple[str, int], int], dict[int, int]]:
-    products = {
-        row["producto_codigo"]: row["producto_key"]
-        for row in fetch_all(
-            target,
-            "SELECT producto_codigo, producto_key FROM dw.dim_producto",
-        )
-    }
-    providers = {
-        (str(row["proveedor_codigo"]), row["proveedor_sucursal_codigo"]): row[
-            "proveedor_key"
-        ]
-        for row in fetch_all(
-            target,
-            """
-            SELECT proveedor_codigo, proveedor_sucursal_codigo, proveedor_key
-            FROM dw.dim_proveedor
-            """,
-        )
-    }
-    buyers = {
-        row["comprador_unidad_codigo_publico"]: row["comprador_key"]
-        for row in fetch_all(
-            target,
-            """
-            SELECT comprador_unidad_codigo_publico, comprador_key
-            FROM dw.dim_comprador
-            """,
-        )
-    }
-    return products, providers, buyers
-
-
-def load_orders(
-    source: psycopg.Connection[Any],
-    target: psycopg.Connection[Any],
-    providers: dict[tuple[str, int], int],
-    buyers: dict[int, int],
+    
+def load_tipo_licitacion(
+    source: psycopg.Connection[Any], target: psycopg.Connection[Any]
 ) -> None:
-    LOGGER.info("Extrayendo fact_orden_compra")
+    LOGGER.info("Extrayendo dim_tipo_licitacion")
+
     rows = fetch_all(
         source,
         """
         SELECT
-            codigo_orden,
-            codigo_licitacion,
-            fecha_creacion,
-            fecha_envio,
-            fecha_aceptacion,
-            fecha_ultima_modificacion,
-            codigo_proveedor,
-            proveedor_sucursal_codigo::bigint AS proveedor_sucursal_codigo,
-            SPLIT_PART(codigo_orden, '-', 1)::bigint
-                AS unidad_codigo_publico,
-            nombre_orden,
-            link,
-            codigo_estado,
-            estado,
-            codigo_estado_proveedor,
-            estado_proveedor,
-            es_compra_confirmada,
-            moneda_orden,
-            monto_total_orden,
-            monto_total_clp,
-            total_neto_orden,
-            COUNT(*)::integer AS cantidad_items
-        FROM staging.vw_oc_limpias
-        GROUP BY
-            codigo_orden,
-            codigo_licitacion,
-            fecha_creacion,
-            fecha_envio,
-            fecha_aceptacion,
-            fecha_ultima_modificacion,
-            codigo_proveedor,
-            proveedor_sucursal_codigo,
-            nombre_orden,
-            link,
-            codigo_estado,
-            estado,
-            codigo_estado_proveedor,
-            estado_proveedor,
-            es_compra_confirmada,
-            moneda_orden,
-            monto_total_orden,
-            monto_total_clp,
-            total_neto_orden
-        ORDER BY codigo_orden
+            tl.codigo_tipo_licitacion,
+            NULLIF(BTRIM(cl.nombre_cat_licitacion), '')
+                AS categoria_lic,
+            NULLIF(BTRIM(tr.nombre_tramo_licitacion), '')
+                AS tramo_lic
+        FROM catalog.tipo_licitacion tl
+        LEFT JOIN catalog.categoria_licitacion cl
+            ON tl.codigo_cat_licitacion = cl.codigo_cat_licitacion
+        LEFT JOIN catalog.tramo_licitacion tr
+            ON tl.codigo_tramo_licitacion = tr.codigo_tramo_licitacion
+        WHERE tl.activo = TRUE
+        ORDER BY tl.codigo_tipo_licitacion
         """,
     )
 
     statement = """
-        INSERT INTO dw.fact_orden_compra (
-            orden_codigo,
-            licitacion_codigo,
-            fecha_creacion_key,
-            fecha_envio_key,
-            fecha_aceptacion_key,
-            fecha_ultima_modificacion_key,
-            proveedor_key,
-            comprador_key,
-            orden_nombre,
-            orden_link,
-            orden_estado_codigo,
-            orden_estado,
-            proveedor_estado_codigo,
-            proveedor_estado,
-            orden_es_confirmada,
-            orden_moneda,
-            orden_monto_total,
-            orden_monto_total_clp,
-            orden_total_neto,
-            orden_cantidad_items
-        ) VALUES (
-            %s, %s, %s, %s, %s, %s,
-            %s, %s, %s, %s, %s, %s, %s,
-            %s, %s, %s, %s, %s, %s, %s
+        INSERT INTO dw.dim_tipo_licitacion (
+            codigo_tipo_licitacion,
+            categoria_lic,
+            tramo_lic
         )
-        ON CONFLICT (orden_codigo) DO UPDATE SET
-            licitacion_codigo = EXCLUDED.licitacion_codigo,
-            fecha_creacion_key = EXCLUDED.fecha_creacion_key,
-            fecha_envio_key = EXCLUDED.fecha_envio_key,
-            fecha_aceptacion_key = EXCLUDED.fecha_aceptacion_key,
-            fecha_ultima_modificacion_key = EXCLUDED.fecha_ultima_modificacion_key,
-            proveedor_key = EXCLUDED.proveedor_key,
-            comprador_key = EXCLUDED.comprador_key,
-            orden_nombre = EXCLUDED.orden_nombre,
-            orden_link = EXCLUDED.orden_link,
-            orden_estado_codigo = EXCLUDED.orden_estado_codigo,
-            orden_estado = EXCLUDED.orden_estado,
-            proveedor_estado_codigo = EXCLUDED.proveedor_estado_codigo,
-            proveedor_estado = EXCLUDED.proveedor_estado,
-            orden_es_confirmada = EXCLUDED.orden_es_confirmada,
-            orden_moneda = EXCLUDED.orden_moneda,
-            orden_monto_total = EXCLUDED.orden_monto_total,
-            orden_monto_total_clp = EXCLUDED.orden_monto_total_clp,
-            orden_total_neto = EXCLUDED.orden_total_neto,
-            orden_cantidad_items = EXCLUDED.orden_cantidad_items,
-            orden_fecha_carga = CURRENT_TIMESTAMP
+        VALUES (%s, %s, %s)
+        ON CONFLICT (codigo_tipo_licitacion) DO UPDATE SET
+            categoria_lic = EXCLUDED.categoria_lic,
+            tramo_lic = EXCLUDED.tramo_lic
     """
 
-    values: list[tuple[Any, ...]] = []
-    for row in rows:
-        provider_id = providers.get(
-            (row["codigo_proveedor"], row["proveedor_sucursal_codigo"])
+    values = [
+        (
+            row["codigo_tipo_licitacion"],
+            row["categoria_lic"],
+            row["tramo_lic"],
         )
-        buyer_id = buyers.get(row["unidad_codigo_publico"])
-        if provider_id is None or buyer_id is None:
-            raise RuntimeError(
-                "No se encontró dimensión para la orden "
-                f"{row['codigo_orden']}: proveedor={provider_id}, "
-                f"comprador={buyer_id}"
-            )
-        values.append(
-            (
-                row["codigo_orden"],
-                row["codigo_licitacion"],
-                date_key(row["fecha_creacion"]),
-                date_key(row["fecha_envio"]),
-                date_key(row["fecha_aceptacion"]),
-                date_key(row["fecha_ultima_modificacion"]),
-                provider_id,
-                buyer_id,
-                row["nombre_orden"],
-                row["link"],
-                row["codigo_estado"],
-                row["estado"],
-                row["codigo_estado_proveedor"],
-                row["estado_proveedor"],
-                row["es_compra_confirmada"],
-                row["moneda_orden"],
-                row["monto_total_orden"],
-                row["monto_total_clp"],
-                row["total_neto_orden"],
-                row["cantidad_items"],
-            )
-        )
+        for row in rows
+    ]
 
     for batch in chunks(values):
         execute_many(target, statement, batch)
-    LOGGER.info("fact_orden_compra procesada: %s filas", len(rows))
 
-
-def load_items(
-    source: psycopg.Connection[Any],
-    target: psycopg.Connection[Any],
-    products: dict[str, int],
-    providers: dict[tuple[str, int], int],
-    buyers: dict[int, int],
-) -> None:
-    LOGGER.info("Extrayendo fact_item_orden_compra")
-    rows = fetch_all(
-        source,
-        """
-        SELECT
-            v.id_item,
-            v.codigo_orden,
-            v.codigo_licitacion,
-            v.codigo_producto,
-            v.fecha_creacion,
-            v.fecha_envio,
-            v.fecha_aceptacion,
-            v.fecha_ultima_modificacion,
-            v.codigo_proveedor,
-            v.proveedor_sucursal_codigo::bigint AS proveedor_sucursal_codigo,
-            SPLIT_PART(v.codigo_orden, '-', 1)::bigint
-                AS unidad_codigo_publico,
-            v.es_compra_confirmada,
-            v.cantidad,
-            v.unidad_medida,
-            v.moneda_item,
-            v.precio_neto,
-            v.cantidad * v.precio_neto
-                - CASE
-                    WHEN r.total_descuentos IS NULL
-                      OR UPPER(TRIM(r.total_descuentos)) IN ('', 'NA', 'N/A')
-                    THEN 0::numeric
-                    ELSE REPLACE(TRIM(r.total_descuentos), ',', '.')::numeric
-                  END
-                + CASE
-                    WHEN r.total_cargos IS NULL
-                      OR UPPER(TRIM(r.total_cargos)) IN ('', 'NA', 'N/A')
-                    THEN 0::numeric
-                    ELSE REPLACE(TRIM(r.total_cargos), ',', '.')::numeric
-                  END AS total_linea_neto
-        FROM staging.vw_oc_limpias v
-        JOIN staging.ordenes_compra_raw r
-          ON TRIM(r.id_item) = v.id_item
-        ORDER BY v.id_item
-        """,
+    LOGGER.info(
+        "dim_tipo_licitacion procesada: %s filas",
+        len(rows),
     )
 
-    statement = """
-        INSERT INTO dw.fact_item_orden_compra (
-            item_id_mercado_publico,
-            orden_codigo,
-            licitacion_codigo,
-            producto_key,
-            fecha_creacion_key,
-            fecha_envio_key,
-            fecha_aceptacion_key,
-            fecha_ultima_modificacion_key,
-            proveedor_key,
-            comprador_key,
-            orden_es_confirmada,
-            item_cantidad,
-            item_unidad_medida,
-            item_moneda,
-            item_precio_neto,
-            item_total_linea_neto
-        ) VALUES (
-            %s, %s, %s, %s, %s, %s, %s, %s,
-            %s, %s, %s, %s, %s, %s, %s, %s
-        )
-        ON CONFLICT (item_id_mercado_publico) DO UPDATE SET
-            orden_codigo = EXCLUDED.orden_codigo,
-            licitacion_codigo = EXCLUDED.licitacion_codigo,
-            producto_key = EXCLUDED.producto_key,
-            fecha_creacion_key = EXCLUDED.fecha_creacion_key,
-            fecha_envio_key = EXCLUDED.fecha_envio_key,
-            fecha_aceptacion_key = EXCLUDED.fecha_aceptacion_key,
-            fecha_ultima_modificacion_key = EXCLUDED.fecha_ultima_modificacion_key,
-            proveedor_key = EXCLUDED.proveedor_key,
-            comprador_key = EXCLUDED.comprador_key,
-            orden_es_confirmada = EXCLUDED.orden_es_confirmada,
-            item_cantidad = EXCLUDED.item_cantidad,
-            item_unidad_medida = EXCLUDED.item_unidad_medida,
-            item_moneda = EXCLUDED.item_moneda,
-            item_precio_neto = EXCLUDED.item_precio_neto,
-            item_total_linea_neto = EXCLUDED.item_total_linea_neto,
-            item_fecha_carga = CURRENT_TIMESTAMP
-    """
-
-    values: list[tuple[Any, ...]] = []
-    for row in rows:
-        product_id = products.get(row["codigo_producto"])
-        provider_id = providers.get(
-            (row["codigo_proveedor"], row["proveedor_sucursal_codigo"])
-        )
-        buyer_id = buyers.get(row["unidad_codigo_publico"])
-        if None in (product_id, provider_id, buyer_id):
-            raise RuntimeError(
-                "No se encontraron todas las claves para el ítem "
-                f"{row['id_item']}"
-            )
-
-        base = (
-            row["id_item"],
-            row["codigo_orden"],
-            row["codigo_licitacion"],
-            product_id,
-            date_key(row["fecha_creacion"]),
-            date_key(row["fecha_envio"]),
-            date_key(row["fecha_aceptacion"]),
-            date_key(row["fecha_ultima_modificacion"]),
-            provider_id,
-            buyer_id,
-            row["es_compra_confirmada"],
-            row["cantidad"],
-            row["unidad_medida"],
-            row["moneda_item"],
-            row["precio_neto"],
-            row["total_linea_neto"],
-        )
-        values.append(base)
-
-    for batch in chunks(values):
-        execute_many(target, statement, batch)
-    LOGGER.info("fact_item_orden_compra procesada: %s filas", len(rows))
 
 
-def validate(target: psycopg.Connection[Any]) -> None:
-    LOGGER.info("Ejecutando validaciones finales")
-    result = fetch_all(
-        target,
-        """
-        SELECT
-            (SELECT COUNT(*) FROM dw.dim_producto) AS productos,
-            (SELECT COUNT(*) FROM dw.dim_proveedor) AS proveedores_sucursales,
-            (SELECT COUNT(*) FROM dw.dim_comprador) AS compradores,
-            (SELECT COUNT(*) FROM dw.fact_orden_compra) AS ordenes,
-            (SELECT COUNT(*) FROM dw.fact_item_orden_compra) AS items
-        """,
-    )[0]
-    LOGGER.info("Conteos finales: %s", result)
-
-    expected = {
-        "productos": 5_718,
-        "proveedores_sucursales": 9_841,
-        "compradores": 2_624,
-        "ordenes": 60_386,
-        "items": 143_320,
-    }
-    for name, minimum in expected.items():
-        if result[name] < minimum:
-            raise RuntimeError(
-                f"Validación fallida: {name}={result[name]}, esperado al menos {minimum}"
-            )
 
 
 def main() -> int:
@@ -733,13 +435,10 @@ def main() -> int:
                 load_products(source, target)
                 load_providers(source, target)
                 load_buyers(source, target)
-                products, providers, buyers = dimension_maps(target)
-                load_orders(source, target, providers, buyers)
-                load_items(source, target, products, providers, buyers)
-                validate(target)
+                load_tipo_licitacion(source, target)
                 target.commit()
         LOGGER.info(
-            "ETL finalizado correctamente | duración=%.2f segundos",
+            "Dimensiones cargadas | duración=%.2f segundos",
             time.monotonic() - started_at,
         )
         return 0
