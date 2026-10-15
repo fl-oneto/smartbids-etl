@@ -1,9 +1,8 @@
 """CSV -> staging.ordenes_compra_raw -> staging.ordenes_compra_limpias.
-
 Python 3.10+, psycopg 3, python-dotenv. Solo usa DB_ORIGEN.
 Cada ejecucion reemplaza el lote completo; no acumula archivos historicos.
 Simula por defecto. --aplicar confirma. Si hay rechazos no confirma salvo
---permitir-rechazos. No modifica catalogos ni carga el DW.
+--permitir-rechazos. No modifica catálogos. Con --aplicar crea la estructura de cabecera en DB_DESTINO, sin cargarla.
 """
 import argparse
 import csv
@@ -15,7 +14,6 @@ from collections import Counter
 from datetime import datetime
 from decimal import Decimal, InvalidOperation, localcontext
 from pathlib import Path
-
 REQUERIDAS = ['Codigo', 'CodigoLicitacion', 'IDItem', 'FechaEnvio',
               'codigoProductoONU', 'CodigoProveedor', 'CodigoOrganismoPublico',
               'CodigoTipo', 'cantidad', 'totalLineaNeto', 'totalImpuestos',
@@ -49,20 +47,14 @@ QUITAR = {'fila_csv', 'codigo_licitacion', 'fecha_creacion',
 INDICES_GUARDAR = [i for i,(c,_) in enumerate(LIMPIAS) if c not in QUITAR]
 COLUMNAS_GUARDAR = [LIMPIAS[i] for i in INDICES_GUARDAR]
 NULOS = {'', 'na', 'n/a', 'null', 'none', 'nan', 's/i'}
-
-
 def texto(v):
     t = (v or '').strip()
     return None if t.casefold() in NULOS else t
-
-
 def requerido(v, campo):
     t = texto(v)
     if t is None:
         raise ValueError(f'{campo}: valor obligatorio ausente')
     return t
-
-
 def entero(v, campo, bits=64):
     t = requerido(v, campo)
     if not re.fullmatch(r'[0-9]+', t):
@@ -71,8 +63,6 @@ def entero(v, campo, bits=64):
     if n > 2**(bits-1)-1:
         raise ValueError(f'{campo}: fuera de rango')
     return n
-
-
 def numero(v, campo, config, cero_si_vacio=False):
     t = texto(v)
     if t is None:
@@ -94,8 +84,6 @@ def numero(v, campo, config, cero_si_vacio=False):
     if not n.is_finite() or abs(n.adjusted())>1000:
         raise ValueError(f'{campo}: fuera del rango numerico permitido')
     return n
-
-
 def fecha(v, campo, formato=None):
     t = texto(v)
     if t is None:
@@ -115,8 +103,6 @@ def fecha(v, campo, formato=None):
         except ValueError:
             pass
     raise ValueError(f'{campo}: fecha no reconocida ({t})')
-
-
 def transformar(f, numero_fila, config):
     codigo = requerido(f['Codigo'], 'Codigo')
     item = requerido(f['IDItem'], 'IDItem')
@@ -145,8 +131,6 @@ def transformar(f, numero_fila, config):
     return (numero_fila, codigo, item, licitacion, *fechas, producto, proveedor,
             organismo, tipo, cantidad, precio, neto, *importes,
             moneda.upper(), moneda_oc.upper() if moneda_oc else None, texto(f.get('Estado')))
-
-
 def convertir_clp(valores, tasas):
     v=list(valores)
     moneda=v[20]
@@ -164,8 +148,6 @@ def convertir_clp(valores, tasas):
             v[i]=v[i]*factor if v[i] is not None else None
     v[20]='CLP'
     return tuple(v)+tuple(originales)+(moneda,factor,fecha_tasa,fuente)
-
-
 def leer_tasas(ruta):
     tasas={}
     if not ruta:
@@ -183,8 +165,6 @@ def leer_tasas(ruta):
                 raise ValueError(f'Paridad duplicada: {clave}')
             tasas[clave]=(factor,publicada,r['fuente'])
     return tasas
-
-
 def ejecutar(config, aplicar=False, permitir_rechazos=False):
     import psycopg
     from psycopg import sql
@@ -303,6 +283,23 @@ def ejecutar(config, aplicar=False, permitir_rechazos=False):
         except Exception:
             conn.rollback()
             raise
+DDL_OC_CABECERA = '\nCREATE TABLE IF NOT EXISTS dw.fact_oc_cabecera (\n    codigo_oc text PRIMARY KEY,\n    fecha_key integer NOT NULL REFERENCES dw.dim_fecha(fecha_key),\n    proveedor_key integer NOT NULL REFERENCES dw.dim_proveedor(proveedor_key),\n    comprador_key integer NOT NULL REFERENCES dw.dim_comprador(comprador_key),\n    tipo_orden_compra_key integer NOT NULL\n        REFERENCES dw.dim_tipo_orden_compra(tipo_orden_compra_key),\n    monto_total_clp numeric NOT NULL\n);\n'
+
+def crear_tabla_oc_cabecera(config):
+    """Crea únicamente la estructura en DB_DESTINO, sin cargar cabeceras."""
+    import psycopg
+    from psycopg.conninfo import make_conninfo
+    dsn = make_conninfo(host=config['PG_HOST'], port=config.get('PG_PORT', '5432'),
+        dbname=config['DB_DESTINO'], user=config['PG_USER'],
+        password=config['PG_PASSWORD'], connect_timeout=10)
+    with psycopg.connect(dsn) as conn, conn.cursor() as cur:
+        cur.execute("SET LOCAL lock_timeout='10s'")
+        cur.execute('CREATE SCHEMA IF NOT EXISTS dw')
+        cur.execute(DDL_OC_CABECERA)
+        for columna in ('fecha_key','proveedor_key','comprador_key','tipo_orden_compra_key'):
+            cur.execute(f'CREATE INDEX IF NOT EXISTS idx_oc_cabecera_{columna} ON dw.fact_oc_cabecera ({columna})')
+        cur.execute("COMMENT ON TABLE dw.fact_oc_cabecera IS 'Una fila por OC con al menos un ítem aceptado en staging; total de cabecera en CLP.'")
+    print('Estructura dw.fact_oc_cabecera creada/verificada en ' + config['DB_DESTINO'])
 
 
 def main():
@@ -315,7 +312,7 @@ def main():
     if not args.env.is_file():
         p.error('No se encontro el .env')
     config = {**dotenv_values(args.env), **os.environ}
-    for clave in ['PG_HOST','PG_USER','PG_PASSWORD','DB_ORIGEN','OC_CSV']:
+    for clave in ['PG_HOST','PG_USER','PG_PASSWORD','DB_ORIGEN','DB_DESTINO','OC_CSV']:
         if not config.get(clave):
             p.error(f'Falta {clave} en .env')
     if config['PG_PASSWORD']=='reemplazar_con_tu_contrasena':
@@ -330,9 +327,13 @@ def main():
             config['OC_PARIDADES_CSV']=str(args.env.resolve().parent/ruta)
     resultado = ejecutar(config,args.aplicar,args.permitir_rechazos)
     print(json.dumps(resultado,ensure_ascii=False,indent=2))
+    if resultado['modo'] == 'aplicado':
+        try:
+            crear_tabla_oc_cabecera(config)
+        except Exception:
+            print('Staging ya fue confirmado. Falló la creación en el DW; son transacciones distintas.')
+            raise
     if resultado['modo']=='cancelado_por_rechazos':
         raise SystemExit(2)
-
-
 if __name__=='__main__':
     main()

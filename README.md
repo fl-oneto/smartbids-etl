@@ -83,3 +83,8 @@ porque el archivo vuelve a aplicar algunos descuentos y cargos. El ETL lo
 reconstruye mediante `cantidad * precio_neto - total_descuentos + total_cargos`.
 Esta fórmula fue conciliada contra `total_neto_oc` para las 60.386 órdenes, sin
 diferencias monetarias materiales.
+
+## Calidad de datos
+
+Las inconsistencias detectadas, sus causas, correcciones y validaciones se
+mantienen en [`DATA_QUALITY_LOG.md`](DATA_QUALITY_LOG.md).

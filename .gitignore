@@ -4,3 +4,4 @@ __pycache__/
 *.pyc
 /venv
 logs/
+oc_2024-01.csv
