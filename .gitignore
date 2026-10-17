@@ -5,3 +5,17 @@ __pycache__/
 /venv
 logs/
 oc_2024-01.csv
+inspeccionar_conciliacion_feather.py
+inspeccionar_feather.py
+reporte_feather_20261017_010419.csv
+reporte_feather_20261017_012026.csv
+reporte_feather_20261017_012801.csv
+reporte_feather_20261017_014450.csv
+reporte_feather_20261017_015419.csv
+reporte_feather_20261017_015419_dimensiones.csv
+reporte_feather_20261017_021529.csv
+reporte_feather_20261017_021529_dimensiones.csv
+reporte_feather_20261017_022238.csv
+reporte_feather_20261017_022238_dimensiones.csv
+revisar_oc_feather.py
+verificar_montos_feather.py
