@@ -1,4 +1,4 @@
-"""ETL incremental desde smartbids hacia smartbids_dw.
+"""ETL dimensional SmartBids (reconstrucción anual 2024).
 
 Carga dimensiones antes de los hechos y usa UPSERT para permitir reejecuciones.
 
@@ -7,6 +7,7 @@ Las credenciales se leen desde variables de entorno o un archivo .env.
 """
 
 from __future__ import annotations
+import argparse
 import logging
 import os
 import sys
@@ -489,57 +490,61 @@ def load_tipo_orden_compra(
 
 
 def load_fact_orden_compra(source, target):
-    """Reconstruye 2024 agrupando por la PK, sin validar unidades.
+    """Reconstruye hechos agregados 2024 con importes ya conciliados en staging.
 
-    Requiere el lote completo de 2024 en staging; conserva los otros años.
+    Conserva filas de otros años. No se agregan totales de cabecera repetidos.
     """
     from decimal import Decimal, localcontext
 
-    LOGGER.info("Extrayendo ítems de 2024 para fact_orden_compra")
-    rows = fetch_all(
-        source,
-        "SELECT oc.* FROM staging.ordenes_compra_limpias oc\n        WHERE oc.fecha_envio >= DATE '2024-01-01' AND oc.fecha_envio < DATE '2025-01-01'",
+    campos = (
+        "neto_item_ajustado_clp", "impuesto_asignado_clp",
+        "cargo_oc_asignado_clp", "descuento_oc_asignado_clp",
+        "monto_bruto_asignado_clp", "cantidad",
     )
+    LOGGER.info("Extrayendo ítems conciliados de 2024")
+    rows = fetch_all(source, """
+        SELECT * FROM staging.ordenes_compra_limpias
+        WHERE fecha_envio >= DATE '2024-01-01'
+          AND fecha_envio < DATE '2025-01-01'
+    """)
     if not rows:
-        raise ValueError("No hay ítems de 2024; se conserva el destino.")
-    LOGGER.info("Ítems extraídos: %s", len(rows))
+        raise ValueError("No hay ítems de 2024: no se modifica el DW.")
+    faltantes = set(campos) - set(rows[0])
+    if faltantes:
+        raise ValueError(f"Staging no contiene las columnas de asignación: {sorted(faltantes)}")
 
     def mapa(query, codigo, key):
-        return {r[codigo]: r[key] for r in fetch_all(target, query)}
+        result = {}
+        for r in fetch_all(target, query):
+            if r[codigo] in result:
+                raise ValueError(f"Dimensión ambigua para {codigo}={r[codigo]}")
+            result[r[codigo]] = r[key]
+        return result
 
     fechas = mapa("SELECT fecha, fecha_key FROM dw.dim_fecha", "fecha", "fecha_key")
-    proveedores = mapa(
-        "SELECT proveedor_codigo, proveedor_key FROM dw.dim_proveedor",
-        "proveedor_codigo",
-        "proveedor_key",
-    )
-    compradores = mapa(
-        "SELECT comprador_organismo_codigo, comprador_key FROM dw.dim_comprador",
-        "comprador_organismo_codigo",
-        "comprador_key",
-    )
-    tipos = mapa(
-        "SELECT codigo_tipo, tipo_orden_compra_key FROM dw.dim_tipo_orden_compra",
-        "codigo_tipo",
-        "tipo_orden_compra_key",
-    )
-    productos = mapa(
-        "SELECT producto_codigo, producto_key FROM dw.dim_producto",
-        "producto_codigo",
-        "producto_key",
-    )
+    proveedores = mapa("SELECT proveedor_codigo, proveedor_key FROM dw.dim_proveedor", "proveedor_codigo", "proveedor_key")
+    compradores = mapa("SELECT comprador_organismo_codigo, comprador_key FROM dw.dim_comprador", "comprador_organismo_codigo", "comprador_key")
+    tipos = mapa("SELECT codigo_tipo, tipo_orden_compra_key FROM dw.dim_tipo_orden_compra", "codigo_tipo", "tipo_orden_compra_key")
+    productos = mapa("SELECT producto_codigo, producto_key FROM dw.dim_producto", "producto_codigo", "producto_key")
+
     grupos = {}
     vistos = set()
-    with localcontext() as context:
-        context.prec = 60
+    codigos_oc = set()
+    total_por_oc = {}
+    with localcontext() as ctx:
+        ctx.prec = 80
         for numero_fila, r in enumerate(rows, 1):
             identidad = (r["codigo"], r["id_item"])
             if not all(identidad) or identidad in vistos:
-                LOGGER.error(
-                    "Ítem duplicado o sin identificación: OC=%s, item=%s", *identidad
-                )
                 raise ValueError(f"Ítem duplicado o sin identificación: {identidad}")
             vistos.add(identidad)
+            codigos_oc.add(r["codigo"])
+            total = r["monto_total_oc_pesos_chilenos"]
+            if total is None:
+                raise ValueError(f"OC sin total CLP: {r['codigo']}")
+            if r["codigo"] in total_por_oc and total_por_oc[r["codigo"]] != total:
+                raise ValueError(f"Total de cabecera inconsistente: {r['codigo']}")
+            total_por_oc[r["codigo"]] = total
             pk = (
                 fechas.get(r["fecha_envio"]),
                 proveedores.get(r["codigo_proveedor"]),
@@ -547,289 +552,125 @@ def load_fact_orden_compra(source, target):
                 tipos.get(r["codigo_tipo"]),
                 productos.get(str(r["codigo_producto_onu"]).strip()),
             )
-            if any((k is None for k in pk)):
-                LOGGER.error(
-                    "Dimensión faltante: OC=%s item=%s fecha=%s proveedor=%s comprador=%s tipo=%s producto=%s claves=%s",
-                    *identidad,
-                    r["fecha_envio"],
-                    r["codigo_proveedor"],
-                    r["codigo_organismo_publico"],
-                    r["codigo_tipo"],
-                    r["codigo_producto_onu"],
-                    pk,
-                )
-                raise ValueError(f"Dimensión faltante: {identidad}, claves={pk}")
-            g = grupos.setdefault(
-                pk, {"medidas": [Decimal(0)] * 5, "ocs": set(), "items": set()}
-            )
-            for i, campo in enumerate(
-                (
-                    "total_linea_neto",
-                    "total_impuestos",
-                    "total_cargos",
-                    "total_descuentos",
-                    "cantidad",
-                )
-            ):
-                if r[campo] is None:
-                    LOGGER.error(
-                        "Medida ausente: campo=%s OC=%s item=%s", campo, *identidad
-                    )
-                    raise ValueError(f"Medida ausente {campo}: {identidad}")
+            if any(k is None for k in pk):
+                raise ValueError(f"Dimensión faltante: OC={r['codigo']} item={r['id_item']} claves={pk}")
+            if any(r[c] is None for c in campos):
+                raise ValueError(f"Medidas incompletas: OC={r['codigo']} item={r['id_item']}")
+            g = grupos.setdefault(pk, {"medidas": [Decimal(0)] * 6, "ocs": set(), "items": 0})
+            for i, campo in enumerate(campos):
                 g["medidas"][i] += r[campo]
             g["ocs"].add(r["codigo"])
-            g["items"].add(identidad)
+            g["items"] += 1
             if numero_fila % 50000 == 0:
-                LOGGER.info(
-                    "Agrupados %s/%s ítems; PK distintas=%s",
-                    numero_fila,
-                    len(rows),
-                    len(grupos),
-                )
+                LOGGER.info("Agrupados %s/%s ítems; grupos=%s", numero_fila, len(rows), len(grupos))
+
+        # No se redondean los montos por grupo; se conserva la precisión de staging.
         values = []
         for pk, g in grupos.items():
-            neto, impuesto, costo, descuento, cantidad = g["medidas"]
-            bruto = neto + impuesto + costo - descuento
+            neto, impuesto, costo, descuento, bruto, cantidad = g["medidas"]
+            if abs(bruto - (neto + impuesto + costo - descuento)) > Decimal("0.01"):
+                raise ValueError(f"Bruto no concilia en grupo {pk}")
             precio = bruto / cantidad if cantidad > 0 else Decimal(0)
-            values.append(
-                (
-                    *pk,
-                    neto,
-                    impuesto,
-                    bruto,
-                    cantidad,
-                    precio,
-                    len(g["ocs"]),
-                    len(g["items"]),
-                    costo,
-                    descuento,
-                )
-            )
-    LOGGER.info(
-        "Agrupación terminada: ítems=%s, filas por PK=%s, grupos con varias OCs=%s",
-        len(rows),
-        len(values),
-        sum(len(g["ocs"]) > 1 for g in grupos.values()),
-    )
-    LOGGER.info(
-        "Precio unitario: monto bruto/cantidad; cantidad cero se guarda como precio 0"
-    )
+            values.append((*pk, neto, impuesto, bruto, cantidad, precio,
+                           len(g["ocs"]), g["items"], costo, descuento))
+
+    # La suma de bruto por ítem debe coincidir con cada total único de OC.
+    # Esta validación fue realizada en staging; se repite globalmente antes del reemplazo.
+    monto_2024 = sum(total_por_oc.values(), Decimal(0))
+    bruto_2024 = sum((r["monto_bruto_asignado_clp"] for r in rows), Decimal(0))
+    if abs(monto_2024 - bruto_2024) > Decimal("0.01"):
+        raise ValueError(f"Monto 2024 no concilia: cabeceras={monto_2024}, ítems={bruto_2024}")
+    LOGGER.info("2024: OC únicas=%s, ítems=%s, grupos=%s, total CLP=%s",
+                len(codigos_oc), len(rows), len(values), monto_2024)
+
     columnas = "fecha_key,proveedor_key,comprador_key,tipo_orden_compra_key,producto_key,monto_neto,impuesto,monto_bruto,cantidad_productos,precio_unitario,cantidad_ordenes_compra,cantidad_items,costo,descuento"
-    with target.transaction():
-        with target.cursor() as cur:
-            cur.execute("SET LOCAL lock_timeout='10s'")
-            cur.execute("LOCK TABLE dw.fact_orden_compra IN SHARE ROW EXCLUSIVE MODE")
-            cur.execute(
-                "DELETE FROM dw.fact_orden_compra f USING dw.dim_fecha d\n                WHERE f.fecha_key=d.fecha_key AND d.fecha>=DATE '2024-01-01'\n                AND d.fecha<DATE '2025-01-01'"
-            )
-        statement = f"INSERT INTO dw.fact_orden_compra ({columnas}) VALUES ({','.join(['%s'] * 14)})"
-        cargadas = 0
-        for numero_lote, batch in enumerate(chunks(values), 1):
-            execute_many(target, statement, batch)
-            cargadas += len(batch)
-            LOGGER.info(
-                "Hechos insertados: %s/%s filas (lote %s; pendientes de commit)",
-                cargadas,
-                len(values),
-                numero_lote,
-            )
-        with target.cursor() as cur:
-            cur.execute(
-                "SELECT COUNT(*), COUNT(*) FILTER (WHERE precio_unitario IS NULL) FROM dw.fact_orden_compra f JOIN dw.dim_fecha d USING (fecha_key) WHERE d.fecha>=DATE '2024-01-01' AND d.fecha<DATE '2025-01-01'"
-            )
-            resultado = cur.fetchone()
-            total, precios_nulos = (
-                resultado.values() if isinstance(resultado, dict) else resultado
-            )
-            if total != len(values) or precios_nulos:
+    with target.cursor() as cur:
+        cur.execute("SET LOCAL lock_timeout='10s'")
+        cur.execute("ALTER TABLE dw.fact_orden_compra ADD COLUMN IF NOT EXISTS total_oc_procesadas bigint")
+        cur.execute("ALTER TABLE dw.fact_orden_compra ADD COLUMN IF NOT EXISTS monto_total_procesado_clp numeric")
+        cur.execute("LOCK TABLE dw.fact_orden_compra IN SHARE ROW EXCLUSIVE MODE")
+        cur.execute("""
+            DELETE FROM dw.fact_orden_compra f USING dw.dim_fecha d
+            WHERE f.fecha_key = d.fecha_key
+              AND d.fecha >= DATE '2024-01-01' AND d.fecha < DATE '2025-01-01'
+        """)
+
+    statement = f"INSERT INTO dw.fact_orden_compra ({columnas}) VALUES ({','.join(['%s'] * 14)})"
+    for n, batch in enumerate(chunks(values), 1):
+        execute_many(target, statement, batch)
+        LOGGER.info("Hechos 2024 insertados: lote %s", n)
+
+    with target.cursor() as cur:
+        cur.execute("""
+            SELECT COUNT(*), COUNT(*) FILTER (WHERE f.precio_unitario IS NULL)
+            FROM dw.fact_orden_compra f JOIN dw.dim_fecha d USING (fecha_key)
+            WHERE d.fecha >= DATE '2024-01-01' AND d.fecha < DATE '2025-01-01'
+        """)
+        total, nulos = cur.fetchone()
+        if total != len(values) or nulos:
+            raise ValueError(f"Verificación fallida: filas={total}, esperadas={len(values)}, precios nulos={nulos}")
+    actualizar_kpi_globales(target, len(codigos_oc), monto_2024)
+
+
+def actualizar_kpi_globales(target, ocs_2024, monto_2024):
+    """Escribe KPI histórico SOLO si se conocen también los de otros años.
+
+    Una tabla agregada por producto NO permite reconstruir OC únicas globales
+    sumando cantidad_ordenes_compra. Nunca se inventan esos KPI.
+    """
+    from decimal import Decimal, InvalidOperation
+    with target.cursor() as cur:
+        cur.execute("""
+            SELECT COUNT(*) FROM dw.fact_orden_compra f
+            JOIN dw.dim_fecha d USING (fecha_key)
+            WHERE d.fecha < DATE '2024-01-01' OR d.fecha >= DATE '2025-01-01'
+        """)
+        filas_otros = cur.fetchone()[0]
+        if filas_otros:
+            texto_ocs = os.getenv("DW_OTROS_ANIOS_OC_UNICAS")
+            texto_monto = os.getenv("DW_OTROS_ANIOS_MONTO_TOTAL_CLP")
+            if not texto_ocs or not texto_monto:
                 raise ValueError(
-                    f"Verificación de hechos fallida: filas={total}, esperadas={len(values)}, precios NULL={precios_nulos}"
+                    "Existen hechos de otros años, pero el conteo único de OC y su monto total "
+                    "no se pueden reconstruir de la tabla agregada. Configura "
+                    "DW_OTROS_ANIOS_OC_UNICAS y DW_OTROS_ANIOS_MONTO_TOTAL_CLP en .env "
+                    "con totales oficiales deduplicados de los otros años; no se aplicó la carga."
                 )
-            LOGGER.info(
-                "Verificación 2024: filas=%s; precios NULL=%s", total, precios_nulos
-            )
-    LOGGER.info(
-        "2024: ítems=%s grupos por PK=%s; cantidades sin conversión de unidades",
-        len(rows),
-        len(values),
-    )
-
-
-DDL_OC_CABECERA = "\nCREATE TABLE IF NOT EXISTS dw.fact_oc_cabecera (\n    codigo_oc text PRIMARY KEY,\n    fecha_key integer NOT NULL REFERENCES dw.dim_fecha(fecha_key),\n    proveedor_key integer NOT NULL REFERENCES dw.dim_proveedor(proveedor_key),\n    comprador_key integer NOT NULL REFERENCES dw.dim_comprador(comprador_key),\n    tipo_orden_compra_key integer NOT NULL\n        REFERENCES dw.dim_tipo_orden_compra(tipo_orden_compra_key),\n    monto_total_clp numeric NOT NULL\n);\n"
-EXTRACCION_OC_CABECERA = "\nWITH codigos AS (\n    SELECT DISTINCT codigo\n    FROM staging.ordenes_compra_limpias\n    WHERE fecha_envio >= %s AND fecha_envio < %s\n)\nSELECT s.codigo,\n    COUNT(*) AS items_staging,\n    COUNT(*) FILTER (WHERE s.codigo IS NULL OR BTRIM(s.codigo)=''\n        OR s.fecha_envio IS NULL OR s.codigo_proveedor IS NULL\n        OR s.codigo_organismo_publico IS NULL OR s.codigo_tipo IS NULL\n        OR s.monto_total_oc_pesos_chilenos IS NULL) AS incompletos,\n    COUNT(DISTINCT s.fecha_envio) AS fechas,\n    COUNT(DISTINCT s.codigo_proveedor) AS proveedores,\n    COUNT(DISTINCT s.codigo_organismo_publico) AS compradores,\n    COUNT(DISTINCT s.codigo_tipo) AS tipos,\n    COUNT(DISTINCT s.monto_total_oc_pesos_chilenos) AS totales,\n    MIN(s.fecha_envio) AS fecha,\n    MIN(s.codigo_proveedor) AS proveedor,\n    MIN(s.codigo_organismo_publico) AS comprador,\n    MIN(s.codigo_tipo) AS tipo,\n    MIN(s.monto_total_oc_pesos_chilenos) AS monto_total_clp\nFROM staging.ordenes_compra_limpias s\nJOIN codigos c ON s.codigo IS NOT DISTINCT FROM c.codigo\nGROUP BY s.codigo\nORDER BY s.codigo;\n"
-
-
-def fetch_cabeceras(conn, query, params=None):
-    with conn.cursor(row_factory=dict_row) as cur:
-        cur.execute(query, params)
-        return cur.fetchall()
-
-
-def validar_oc_cabeceras(rows, inicio, fin):
-    if not rows:
-        raise ValueError("No hay OCs para el año solicitado; se conserva el destino.")
-    errores = 0
-    for r in rows:
-        motivo = None
-        if r["incompletos"]:
-            motivo = "Campos obligatorios ausentes"
-        elif any(
-            r[c] != 1
-            for c in ("fechas", "proveedores", "compradores", "tipos", "totales")
-        ):
-            motivo = "Cabecera inconsistente entre ítems (fecha/proveedor/comprador/tipo/total)"
-        elif not inicio <= r["fecha"] < fin:
-            motivo = "Fecha fuera del año solicitado"
-        elif not r["monto_total_clp"].is_finite():
-            motivo = "Total no finito"
-        if motivo:
-            LOGGER.error("OC=%s | %s | datos=%s", r["codigo"], motivo, r)
-            errores += 1
-    if errores:
-        raise ValueError(f"{errores} OCs inválidas; no se carga un lote parcial.")
-
-
-def preparar_oc_cabeceras(target, rows):
-    def mapa(query, codigo, key):
-        result = {}
-        for r in fetch_cabeceras(target, query):
-            if r[codigo] in result:
-                raise ValueError(f"Código de dimensión ambiguo: {r[codigo]}")
-            result[r[codigo]] = r[key]
-        return result
-
-    fechas = mapa("SELECT fecha, fecha_key FROM dw.dim_fecha", "fecha", "fecha_key")
-    proveedores = mapa(
-        "SELECT proveedor_codigo, proveedor_key FROM dw.dim_proveedor",
-        "proveedor_codigo",
-        "proveedor_key",
-    )
-    compradores = mapa(
-        "SELECT comprador_organismo_codigo, comprador_key FROM dw.dim_comprador",
-        "comprador_organismo_codigo",
-        "comprador_key",
-    )
-    tipos = mapa(
-        "SELECT codigo_tipo, tipo_orden_compra_key FROM dw.dim_tipo_orden_compra",
-        "codigo_tipo",
-        "tipo_orden_compra_key",
-    )
-    values = []
-    errores = 0
-    for r in rows:
-        keys = (
-            fechas.get(r["fecha"]),
-            proveedores.get(r["proveedor"]),
-            compradores.get(r["comprador"]),
-            tipos.get(r["tipo"]),
-        )
-        if any(k is None for k in keys):
-            LOGGER.error(
-                "OC=%s | dimensión faltante | fecha=%s proveedor=%s comprador=%s tipo=%s claves=%s",
-                r["codigo"],
-                r["fecha"],
-                r["proveedor"],
-                r["comprador"],
-                r["tipo"],
-                keys,
-            )
-            errores += 1
+            try:
+                ocs_otros = int(texto_ocs)
+                monto_otros = Decimal(texto_monto)
+            except (ValueError, InvalidOperation) as exc:
+                raise ValueError("KPI de otros años inválidos en .env") from exc
+            if ocs_otros < 0 or not monto_otros.is_finite() or monto_otros < 0:
+                raise ValueError("KPI de otros años negativos o no finitos")
+            LOGGER.warning("KPI otros años provienen del .env: verificar unicidad entre fuentes/años")
         else:
-            values.append((r["codigo"], *keys, r["monto_total_clp"]))
-    if errores:
-        raise ValueError(
-            f"{errores} OCs sin dimensiones; ejecuta primero el ETL de dimensiones."
-        )
-    return values
-
-
-def load_fact_oc_cabecera(source, target, anio=2024):
-    inicio, fin = date(anio, 1, 1), date(anio + 1, 1, 1)
-    LOGGER.info("Extrayendo cabeceras de %s desde staging limpia", anio)
-    rows = fetch_cabeceras(source, EXTRACCION_OC_CABECERA, (inicio, fin))
-    validar_oc_cabeceras(rows, inicio, fin)
-    LOGGER.info(
-        "OCs únicas=%s; ítems de staging asociados=%s",
-        len(rows),
-        sum(r["items_staging"] for r in rows),
-    )
-    values = preparar_oc_cabeceras(target, rows)
-    # Use SQL numeric for exact totals instead of the default Decimal precision.
-    with target.cursor() as cur:
-        cur.execute("SET LOCAL lock_timeout = '10s'")
-        cur.execute("CREATE SCHEMA IF NOT EXISTS dw")
-        cur.execute(DDL_OC_CABECERA)
-        for column in (
-            "fecha_key",
-            "proveedor_key",
-            "comprador_key",
-            "tipo_orden_compra_key",
-        ):
-            cur.execute(
-                f"CREATE INDEX IF NOT EXISTS idx_oc_cabecera_{column} ON dw.fact_oc_cabecera ({column})"
-            )
-        cur.execute(
-            "COMMENT ON TABLE dw.fact_oc_cabecera IS 'Una fila por OC con al menos un ítem aceptado en staging; total completo de cabecera en CLP, no monto de productos filtrados.'"
-        )
-        cur.execute("LOCK TABLE dw.fact_oc_cabecera IN SHARE ROW EXCLUSIVE MODE")
-        cur.execute(
-            "CREATE TEMP TABLE carga_oc_cabecera (LIKE dw.fact_oc_cabecera INCLUDING DEFAULTS) ON COMMIT DROP"
-        )
-    statement = """INSERT INTO carga_oc_cabecera
-        (codigo_oc,fecha_key,proveedor_key,comprador_key,tipo_orden_compra_key,monto_total_clp)
-        VALUES (%s,%s,%s,%s,%s,%s)"""
-    with target.cursor() as cur:
-        for start in range(0, len(values), BATCH_SIZE):
-            batch = values[start : start + BATCH_SIZE]
-            cur.executemany(statement, batch)
-            LOGGER.info("Preparadas %s/%s cabeceras", start + len(batch), len(values))
-        # An existing code in another year is not silently moved/overwritten.
-        cur.execute(
-            """SELECT f.codigo_oc FROM dw.fact_oc_cabecera f
-            JOIN carga_oc_cabecera c USING (codigo_oc)
-            JOIN dw.dim_fecha d ON d.fecha_key=f.fecha_key
-            WHERE d.fecha < %s OR d.fecha >= %s LIMIT 10""",
-            (inicio, fin),
-        )
-        conflictos = cur.fetchall()
-        if conflictos:
-            raise ValueError(f"Códigos ya cargados en otro año: {conflictos}")
-        cur.execute(
-            """DELETE FROM dw.fact_oc_cabecera f USING dw.dim_fecha d
-            WHERE d.fecha_key=f.fecha_key AND d.fecha >= %s AND d.fecha < %s""",
-            (inicio, fin),
-        )
-        LOGGER.info(
-            "Cabeceras previas de %s retiradas en la transacción: %s",
-            anio,
-            cur.rowcount,
-        )
-        cur.execute(
-            "INSERT INTO dw.fact_oc_cabecera (codigo_oc,fecha_key,proveedor_key,comprador_key,tipo_orden_compra_key,monto_total_clp) SELECT codigo_oc,fecha_key,proveedor_key,comprador_key,tipo_orden_compra_key,monto_total_clp FROM carga_oc_cabecera"
-        )
-        cur.execute(
-            """SELECT COUNT(*), SUM(monto_total_clp) FROM dw.fact_oc_cabecera f
-            JOIN dw.dim_fecha d USING (fecha_key) WHERE d.fecha >= %s AND d.fecha < %s""",
-            (inicio, fin),
-        )
-        total, monto = cur.fetchone()
-        cur.execute("SELECT COUNT(*), SUM(monto_total_clp) FROM carga_oc_cabecera")
-        esperados, esperado_monto = cur.fetchone()
-        if (total, monto) != (esperados, esperado_monto):
-            raise ValueError("Los totales destino no coinciden con el lote preparado.")
-        LOGGER.info(
-            "Verificación: OCs=%s; monto total de cabeceras CLP=%s", total, monto
-        )
-    LOGGER.info("Cabeceras listas; pendientes del commit del ETL principal.")
+            ocs_otros, monto_otros = 0, Decimal(0)
+        total_ocs = ocs_2024 + ocs_otros
+        total_monto = monto_2024 + monto_otros
+        cur.execute("""
+            UPDATE dw.fact_orden_compra
+            SET total_oc_procesadas = %s,
+                monto_total_procesado_clp = %s
+        """, (total_ocs, total_monto))
+    LOGGER.info("KPI globales: %s OC únicas; monto CLP=%s", total_ocs, total_monto)
 
 
 def main() -> int:
+    parser = argparse.ArgumentParser(
+        description="ETL dimensional SmartBids: simulación por defecto; --aplicar confirma cambios."
+    )
+    parser.add_argument(
+        "--aplicar", action="store_true",
+        help="Confirma los cambios en PostgreSQL; sin esta opción se revierten."
+    )
+    args = parser.parse_args()
     load_dotenv()
     log_file = configure_logging()
     source_db = os.getenv("DB_ORIGEN", "smartbids")
     target_db = os.getenv("DB_DESTINO", "smartbids_dw")
     started_at = time.monotonic()
-    LOGGER.info("Iniciando ETL %s -> %s | log=%s", source_db, target_db, log_file)
+    LOGGER.info("Iniciando ETL %s -> %s | modo=%s | log=%s", source_db, target_db, "APLICAR" if args.aplicar else "SIMULACIÓN", log_file)
     try:
         with psycopg.connect(**connection_kwargs(source_db)) as source:
             with psycopg.connect(**connection_kwargs(target_db)) as target:
@@ -838,11 +679,16 @@ def main() -> int:
                 load_providers(source, target)
                 load_buyers(source, target)
                 load_tipo_orden_compra(source, target)
-                load_fact_oc_cabecera(source, target)
                 load_fact_orden_compra(source, target)
-                target.commit()
+                if args.aplicar:
+                    target.commit()
+                    LOGGER.info("MODO APLICAR: transacción confirmada en %s", target_db)
+                else:
+                    target.rollback()
+                    LOGGER.info("MODO SIMULACIÓN: validaciones completadas y cambios revertidos en %s", target_db)
         LOGGER.info(
-            "ETL confirmado: dimensiones, cabeceras y hechos agrupados | duración=%.2f segundos",
+            "ETL %s: dimensiones, hechos agrupados y KPI globales | duración=%.2f segundos",
+            "confirmado" if args.aplicar else "simulado sin persistir",
             time.monotonic() - started_at,
         )
         return 0

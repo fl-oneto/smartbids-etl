@@ -1,8 +1,8 @@
 """CSV -> staging.ordenes_compra_raw -> staging.ordenes_compra_limpias.
 Python 3.10+, psycopg 3, python-dotenv. Solo usa DB_ORIGEN.
 Cada ejecucion reemplaza el lote completo; no acumula archivos historicos.
-Simula por defecto. --aplicar confirma. Si hay rechazos no confirma salvo
---permitir-rechazos. No modifica catálogos. Con --aplicar crea la estructura de cabecera en DB_DESTINO, sin cargarla.
+Simula por defecto. --aplicar confirma. Con rechazos no confirma para proteger
+la conciliacion por OC. No modifica catálogos. Con --aplicar crea la estructura de cabecera en DB_DESTINO, sin cargarla.
 """
 import argparse
 import csv
@@ -18,7 +18,8 @@ REQUERIDAS = ['Codigo', 'CodigoLicitacion', 'IDItem', 'FechaEnvio',
               'codigoProductoONU', 'CodigoProveedor', 'CodigoOrganismoPublico',
               'CodigoTipo', 'cantidad', 'totalLineaNeto', 'totalImpuestos',
               'totalCargos', 'totalDescuentos', 'monedaItem', 'TipoMonedaOC',
-              'MontoTotalOC_PesosChilenos']
+              'MontoTotalOC', 'MontoTotalOC_PesosChilenos', 'TotalNetoOC',
+              'Impuestos', 'Cargos', 'Descuentos']
 FECHAS = [('FechaCreacion', 'fecha_creacion'), ('FechaEnvio', 'fecha_envio'),
           ('FechaSolicitudCancelacion', 'fecha_solicitud_cancelacion'),
           ('fechaUltimaModificacion', 'fecha_ultima_modificacion'),
@@ -36,7 +37,26 @@ ORIGINALES = [('precio_neto_original','numeric'),('total_linea_neto_original','n
               ('total_descuentos_original','numeric'),('moneda_original','text'),
               ('tasa_clp','numeric'),('fecha_tasa','date'),('fuente_tasa','text')]
 LIMPIAS += ORIGINALES
-LIMPIAS += [('monto_total_oc_pesos_chilenos', 'numeric')]
+LIMPIAS += [
+    ('neto_item_ajustado_original', 'numeric'),
+    ('neto_item_ajustado_clp', 'numeric'),
+    ('impuesto_oc_original', 'numeric'),
+    ('impuesto_oc_clp', 'numeric'),
+    ('impuesto_asignado_clp', 'numeric'),
+    ('descuento_oc_original', 'numeric'),
+    ('descuento_oc_clp', 'numeric'),
+    ('descuento_oc_asignado_clp', 'numeric'),
+    ('cargo_oc_original', 'numeric'),
+    ('cargo_oc_clp', 'numeric'),
+    ('cargo_oc_asignado_clp', 'numeric'),
+    ('monto_bruto_asignado_clp', 'numeric'),
+    ('tipo_impuesto_oc', 'text'),
+    ('monto_total_oc_pesos_chilenos', 'numeric'),
+            ('monto_total_oc_original', 'numeric'),
+            ('monto_total_oc_clp_fuente', 'numeric'),
+            ('moneda_item_declarada', 'text'),
+            ('moneda_oc_declarada', 'text'),
+            ('moneda_ajustada', 'boolean')]
 # La transformacion interna conserva su orden; esta proyeccion define
 # exclusivamente las columnas persistidas en la tabla limpia.
 QUITAR = {'fila_csv', 'codigo_licitacion', 'fecha_creacion',
@@ -165,6 +185,96 @@ def leer_tasas(ruta):
                 raise ValueError(f'Paridad duplicada: {clave}')
             tasas[clave]=(factor,publicada,r['fuente'])
     return tasas
+def analizar_oc(archivo, config, delimitador):
+    """Primera pasada completa: conciliacion por OC y base de distribucion.
+
+    Importes siempre en moneda de cabecera ORIGINAL. Solo se incluyen filas
+    elegibles por CodigoLicitacion, igual que en la segunda pasada.
+    """
+    grupos = {}
+    campos = ('TotalNetoOC', 'Impuestos', 'Cargos', 'Descuentos', 'MontoTotalOC')
+    with Path(archivo).open(encoding=config.get('OC_ENCODING', 'utf-8-sig'), newline='') as f:
+        for fila in csv.DictReader(f, delimiter=delimitador):
+            if not texto(fila.get('CodigoLicitacion')):
+                continue
+            codigo = texto(fila.get('Codigo'))
+            if not codigo:
+                continue
+            g = grupos.setdefault(codigo, {
+                'suma_base': Decimal(0), 'suma_neto': Decimal(0),
+                'cabeceras': {k: set() for k in campos},
+                'monedas_oc': set(), 'tipos_impuesto': set(),
+                'discrepancia': False, 'valido': True, 'filas': 0,
+                'error': None,
+            })
+            g['filas'] += 1
+            moneda_oc = texto(fila.get('TipoMonedaOC'))
+            moneda_item = texto(fila.get('monedaItem')) or moneda_oc
+            g['monedas_oc'].add(moneda_oc.upper() if moneda_oc else None)
+            g['tipos_impuesto'].add(texto(fila.get('TipoImpuesto')))
+            if moneda_oc and moneda_item and moneda_oc.upper() != moneda_item.upper():
+                g['discrepancia'] = True
+            try:
+                neto = numero(fila.get('totalLineaNeto'), 'totalLineaNeto', config)
+                descuento = numero(fila.get('totalDescuentos'), 'totalDescuentos', config)
+                cargo = numero(fila.get('totalCargos'), 'totalCargos', config)
+                g['suma_neto'] += neto
+                base = neto + descuento - cargo
+                if base < 0:
+                    raise ValueError('base ajustada negativa')
+                g['suma_base'] += base
+                for campo in campos:
+                    g['cabeceras'][campo].add(numero(fila.get(campo), campo, config))
+            except ValueError as exc:
+                g['valido'] = False
+                g['error'] = str(exc)
+    for codigo, g in grupos.items():
+        if not g['valido'] or len(g['monedas_oc']) != 1 or None in g['monedas_oc']:
+            g['valido'] = False
+            g['error'] = g['error'] or 'moneda de cabecera inconsistente'
+            continue
+        if any(len(v) != 1 for v in g['cabeceras'].values()):
+            g['valido'] = False
+            g['error'] = 'importes de cabecera inconsistentes'
+            continue
+        g['cabecera'] = {k: next(iter(v)) for k,v in g['cabeceras'].items()}
+        c = g['cabecera']
+        if abs(g['suma_base'] - c['TotalNetoOC']) > Decimal('0.01'):
+            g['valido'] = False
+            g['error'] = 'neto ajustado no concilia con cabecera'
+        elif abs(c['TotalNetoOC'] + c['Impuestos'] + c['Cargos'] - c['Descuentos'] - c['MontoTotalOC']) > Decimal('0.01'):
+            g['valido'] = False
+            g['error'] = 'total de cabecera no concilia'
+        elif g['suma_base'] == 0 and any(c[x] != 0 for x in ('Impuestos', 'Cargos', 'Descuentos')):
+            g['valido'] = False
+            g['error'] = 'base cero con ajustes no nulos'
+        elif len(g['tipos_impuesto']) != 1:
+            g['valido'] = False
+            g['error'] = 'tipo impuesto inconsistente dentro de OC'
+        g['procesadas'] = 0
+        g['acumulados'] = {k: Decimal(0) for k in ('Impuestos', 'Cargos', 'Descuentos')}
+    return grupos
+
+
+def asignar_cabecera(g, base_item):
+    """Devuelve asignaciones originales; ultimo item absorbe residuo exacto."""
+    g['procesadas'] += 1
+    ultimo = g['procesadas'] == g['filas']
+    resultado = {}
+    with localcontext() as ctx:
+        ctx.prec = 60
+        for campo in ('Impuestos', 'Cargos', 'Descuentos'):
+            importe = g['cabecera'][campo]
+            if ultimo:
+                asignacion = importe - g['acumulados'][campo]
+            elif g['suma_base'] == 0:
+                asignacion = Decimal(0)
+            else:
+                asignacion = importe * base_item / g['suma_base']
+            g['acumulados'][campo] += asignacion
+            resultado[campo] = asignacion
+    return resultado
+
 def ejecutar(config, aplicar=False, permitir_rechazos=False):
     import psycopg
     from psycopg import sql
@@ -180,6 +290,8 @@ def ejecutar(config, aplicar=False, permitir_rechazos=False):
     dec, miles = config.get('OC_DECIMAL', '.'), config.get('OC_MILES', '') or ''
     if dec not in ('.', ',') or (miles and (miles == dec or len(miles) != 1)):
         raise ValueError('Separadores decimal/miles invalidos')
+    # Concilia dinamicamente los casos de moneda discrepante antes de transformar.
+    grupos_oc = analizar_oc(archivo, config, delimitador)
     resumen = Counter()
     motivos, monedas = Counter(), Counter()
     vistos = set()
@@ -237,12 +349,59 @@ def ejecutar(config, aplicar=False, permitir_rechazos=False):
                                 resumen['sin_licitacion'] += 1
                                 continue
                             try:
-                                valores = convertir_clp(transformar(fila, n, config),tasas)
-                                # El total de cabecera ya esta expresado en CLP.
-                                # Se conserva por OC y se repite en cada item.
-                                total_oc = numero(fila['MontoTotalOC_PesosChilenos'],
-                                                  'MontoTotalOC_PesosChilenos',config)
-                                valores += (total_oc,)
+                                moneda_oc = texto(fila.get('TipoMonedaOC'))
+                                if not moneda_oc:
+                                    raise ValueError('TipoMonedaOC: moneda de cabecera ausente')
+                                moneda_oc = moneda_oc.upper()
+                                moneda_item = (texto(fila.get('monedaItem')) or moneda_oc).upper()
+                                discrepancia = moneda_item != moneda_oc
+                                fila_efectiva = fila
+                                if discrepancia:
+                                    if not grupos_oc.get(texto(fila.get('Codigo')), {}).get('valido', False):
+                                        raise ValueError('moneda: discrepancia sin conciliacion de OC')
+                                    fila_efectiva = fila.copy()
+                                    fila_efectiva['monedaItem'] = moneda_oc
+                                g = grupos_oc.get(texto(fila.get('Codigo')))
+                                if not g or not g['valido']:
+                                    raise ValueError('conciliacion_oc: ' + (g['error'] if g else 'OC inexistente'))
+                                valores = convertir_clp(transformar(fila_efectiva, n, config), tasas)
+                                # Los originales declarados se conservan para auditoria.
+                                total_oc_original = numero(fila['MontoTotalOC'], 'MontoTotalOC', config)
+                                total_oc_clp_fuente = numero(
+                                    fila['MontoTotalOC_PesosChilenos'],
+                                    'MontoTotalOC_PesosChilenos', config
+                                )
+                                # convertir_clp ya determino y persistio la tasa de cada item.
+                                # La cabecera se convierte con esa MISMA tasa, sin redondearla.
+                                with localcontext() as ctx:
+                                    ctx.prec = 60
+                                    total_oc_clp = total_oc_original * valores[29]
+                                # Las asignaciones se hacen en moneda original y luego
+                                # se convierten con la misma tasa de FechaEnvio.
+                                with localcontext() as ctx:
+                                    ctx.prec = 60
+                                    neto_ajustado_original = (
+                                        valores[24] + valores[27] - valores[26]
+                                    )
+                                    asignados = asignar_cabecera(g, neto_ajustado_original)
+                                    tasa = valores[29]
+                                    neto_ajustado_clp = neto_ajustado_original * tasa
+                                    imp_oc = g['cabecera']['Impuestos']
+                                    cargo_oc = g['cabecera']['Cargos']
+                                    dto_oc = g['cabecera']['Descuentos']
+                                    imp_asig = asignados['Impuestos'] * tasa
+                                    cargo_asig = asignados['Cargos'] * tasa
+                                    dto_asig = asignados['Descuentos'] * tasa
+                                    bruto_asig = neto_ajustado_clp + imp_asig + cargo_asig - dto_asig
+                                valores += (
+                                    neto_ajustado_original, neto_ajustado_clp,
+                                    imp_oc, imp_oc * tasa, imp_asig,
+                                    dto_oc, dto_oc * tasa, dto_asig,
+                                    cargo_oc, cargo_oc * tasa, cargo_asig,
+                                    bruto_asig, next(iter(g['tipos_impuesto'])),
+                                    total_oc_clp, total_oc_original, total_oc_clp_fuente,
+                                    moneda_item, moneda_oc, discrepancia
+                                )
                                 clave = (valores[1], valores[2])
                                 if clave in vistos:
                                     raise ValueError('Codigo + IDItem repetido: resolver duplicado/version antes de cargar DW')
@@ -250,6 +409,8 @@ def ejecutar(config, aplicar=False, permitir_rechazos=False):
                                 wl.writerow([valores[i] for i in INDICES_GUARDAR])
                                 monedas[valores[20]] += 1
                                 resumen['filas_limpias'] += 1
+                                if discrepancia:
+                                    resumen['moneda_corregida'] += 1
                                 if valores[14] != valores[14].to_integral_value():
                                     resumen['cantidades_fraccionarias'] += 1
                             except ValueError as error:
@@ -270,7 +431,9 @@ def ejecutar(config, aplicar=False, permitir_rechazos=False):
                         while bloque := datos.read(1024*1024):
                             copia.write(bloque)
                 cur.execute('CREATE INDEX IF NOT EXISTS idx_oc_limpias_codigo ON staging.ordenes_compra_limpias (codigo)')
-            cancelado = aplicar and bool(resumen['rechazos']) and not permitir_rechazos
+            # Nunca confirmar un lote parcial: la distribucion presupone
+            # que todas las lineas elegibles de cada OC estan presentes.
+            cancelado = aplicar and bool(resumen['rechazos'])
             if aplicar and not cancelado:
                 conn.commit()
             else:
@@ -279,35 +442,18 @@ def ejecutar(config, aplicar=False, permitir_rechazos=False):
                     'base': config['DB_ORIGEN'], **resumen, 'motivos_rechazo': dict(motivos),
                     'monedas_items': dict(monedas),
                     'compatible_importes_DW_actual': bool(monedas) and set(monedas)=={'CLP'},
-                    'advertencia': 'Importes convertidos a CLP por fecha_envio. Revisar cantidades fraccionarias: el DW actual las convierte a integer.'}
+                    'oc_conciliadas': sum(g['valido'] for g in grupos_oc.values()),
+                    'oc_no_conciliadas': sum(not g['valido'] for g in grupos_oc.values()),
+                    'advertencia': 'Impuestos/cargos/descuentos de CABECERA asignados proporcionalmente al neto ajustado de item, en CLP por FechaEnvio. No usar SUM sobre columnas de cabecera repetidas. No carga el DW.'}
         except Exception:
             conn.rollback()
             raise
-DDL_OC_CABECERA = '\nCREATE TABLE IF NOT EXISTS dw.fact_oc_cabecera (\n    codigo_oc text PRIMARY KEY,\n    fecha_key integer NOT NULL REFERENCES dw.dim_fecha(fecha_key),\n    proveedor_key integer NOT NULL REFERENCES dw.dim_proveedor(proveedor_key),\n    comprador_key integer NOT NULL REFERENCES dw.dim_comprador(comprador_key),\n    tipo_orden_compra_key integer NOT NULL\n        REFERENCES dw.dim_tipo_orden_compra(tipo_orden_compra_key),\n    monto_total_clp numeric NOT NULL\n);\n'
-
-def crear_tabla_oc_cabecera(config):
-    """Crea únicamente la estructura en DB_DESTINO, sin cargar cabeceras."""
-    import psycopg
-    from psycopg.conninfo import make_conninfo
-    dsn = make_conninfo(host=config['PG_HOST'], port=config.get('PG_PORT', '5432'),
-        dbname=config['DB_DESTINO'], user=config['PG_USER'],
-        password=config['PG_PASSWORD'], connect_timeout=10)
-    with psycopg.connect(dsn) as conn, conn.cursor() as cur:
-        cur.execute("SET LOCAL lock_timeout='10s'")
-        cur.execute('CREATE SCHEMA IF NOT EXISTS dw')
-        cur.execute(DDL_OC_CABECERA)
-        for columna in ('fecha_key','proveedor_key','comprador_key','tipo_orden_compra_key'):
-            cur.execute(f'CREATE INDEX IF NOT EXISTS idx_oc_cabecera_{columna} ON dw.fact_oc_cabecera ({columna})')
-        cur.execute("COMMENT ON TABLE dw.fact_oc_cabecera IS 'Una fila por OC con al menos un ítem aceptado en staging; total de cabecera en CLP.'")
-    print('Estructura dw.fact_oc_cabecera creada/verificada en ' + config['DB_DESTINO'])
-
-
 def main():
     from dotenv import dotenv_values
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument('--env', type=Path, default=Path('.env'))
     p.add_argument('--aplicar', action='store_true')
-    p.add_argument('--permitir-rechazos', action='store_true', help='Guarda raw completa, limpias validas y rechazos')
+    p.add_argument('--permitir-rechazos', action='store_true', help='Compatibilidad: no habilita cargas parciales con importes asignados')
     args = p.parse_args()
     if not args.env.is_file():
         p.error('No se encontro el .env')
@@ -327,12 +473,7 @@ def main():
             config['OC_PARIDADES_CSV']=str(args.env.resolve().parent/ruta)
     resultado = ejecutar(config,args.aplicar,args.permitir_rechazos)
     print(json.dumps(resultado,ensure_ascii=False,indent=2))
-    if resultado['modo'] == 'aplicado':
-        try:
-            crear_tabla_oc_cabecera(config)
-        except Exception:
-            print('Staging ya fue confirmado. Falló la creación en el DW; son transacciones distintas.')
-            raise
+    # No crea una segunda tabla de hechos; staging solamente.
     if resultado['modo']=='cancelado_por_rechazos':
         raise SystemExit(2)
 if __name__=='__main__':
