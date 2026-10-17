@@ -467,6 +467,7 @@ def load_tipo_orden_compra(
     values = [
         (8, "SE", "Sin emisión automatica"),
         (9, "CM", "Convenio marco"),
+        (10, "TD", "Trato Directo"),
         (13, "AG", "Compra agil"),
         (14, "CC", "Compra coordinada"),
     ]
@@ -664,6 +665,10 @@ def main() -> int:
         "--aplicar", action="store_true",
         help="Confirma los cambios en PostgreSQL; sin esta opción se revierten."
     )
+    parser.add_argument(
+        "--solo-tipos", action="store_true",
+        help="Carga únicamente dim_tipo_orden_compra; no modifica los hechos."
+    )
     args = parser.parse_args()
     load_dotenv()
     log_file = configure_logging()
@@ -672,14 +677,18 @@ def main() -> int:
     started_at = time.monotonic()
     LOGGER.info("Iniciando ETL %s -> %s | modo=%s | log=%s", source_db, target_db, "APLICAR" if args.aplicar else "SIMULACIÓN", log_file)
     try:
-        with psycopg.connect(**connection_kwargs(source_db)) as source:
-            with psycopg.connect(**connection_kwargs(target_db)) as target:
-                load_fecha(source, target)
-                load_products(source, target)
-                load_providers(source, target)
-                load_buyers(source, target)
-                load_tipo_orden_compra(source, target)
-                load_fact_orden_compra(source, target)
+        with psycopg.connect(**connection_kwargs(target_db)) as target:
+            if args.solo_tipos:
+                # Esta dimensión utiliza un catálogo local; no necesita conexión de origen.
+                load_tipo_orden_compra(target, target)
+            else:
+                with psycopg.connect(**connection_kwargs(source_db)) as source:
+                    load_fecha(source, target)
+                    load_products(source, target)
+                    load_providers(source, target)
+                    load_buyers(source, target)
+                    load_tipo_orden_compra(source, target)
+                    load_fact_orden_compra(source, target)
                 if args.aplicar:
                     target.commit()
                     LOGGER.info("MODO APLICAR: transacción confirmada en %s", target_db)
